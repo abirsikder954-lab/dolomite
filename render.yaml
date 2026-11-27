@@ -1,0 +1,72 @@
+# Dolomite External — licence server on Render
+#
+# Put this file at the REPOSITORY ROOT; Render only looks for render.yaml
+# there. It works with any of these layouts:
+#
+#   A. server/ committed as a folder
+#   B. only Dolomite-monorepo.zip in the repository
+#   C. only dolomite-dashboard.zip in the repository
+#
+# Render's build context is the repository root, so the commands below locate
+# the server wherever it happens to live.
+
+services:
+  - type: web
+    name: dolomite-external
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: |
+      set -e
+      echo "--- locating the server ---"
+      if [ -f server/server.js ]; then
+        echo "using the committed server/ folder"
+      elif [ -f server.js ]; then
+        echo "using the repository root"
+        mkdir -p server
+        for item in server.js package.json lib public worker test scripts data; do
+          [ -e "$item" ] && cp -R "$item" server/ || true
+        done
+      else
+        for zip in Dolomite-monorepo.zip dolomite-dashboard.zip; do
+          [ -f "$zip" ] || continue
+          echo "extracting server/ from $zip"
+          rm -rf /tmp/dolo && mkdir -p /tmp/dolo
+          unzip -q "$zip" -d /tmp/dolo
+          if [ -f "/tmp/dolo/server/server.js" ]; then
+            mkdir -p server && cp -R /tmp/dolo/server/. server/
+            break
+          fi
+          if [ -f "/tmp/dolo/server.js" ]; then
+            mkdir -p server && cp -R /tmp/dolo/. server/
+            break
+          fi
+        done
+      fi
+
+      if [ ! -f server/server.js ]; then
+        echo "ERROR: server/server.js was not found."
+        echo "Upload Dolomite-monorepo.zip to the repository root, or commit the server/ folder."
+        exit 1
+      fi
+
+      echo "--- installing dependencies ---"
+      cd server && npm install --omit=dev
+      echo "--- build finished ---"
+    startCommand: |
+      set -e
+      cd server && exec node server.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: ADMIN_PASSWORD
+        generateValue: true
+      - key: DATA_DIR
+        value: /var/data
+      - key: PUBLIC_BASE_URL
+        sync: false
+    disk:
+      name: dolomite-data
+      mountPath: /var/data
+      sizeGB: 1
