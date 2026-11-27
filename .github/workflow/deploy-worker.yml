@@ -1,0 +1,198 @@
+name: Deploy licence server (Cloudflare Worker)
+
+# The server lives in server/. Every `run:` step works inside that folder
+# (see `defaults.run.working-directory`), so `npm test` and `wrangler deploy`
+# find the project root.
+#
+# If server/ is missing but a project archive is present (Dolomite-monorepo.zip
+# or dolomite-dashboard.zip), the "Prepare the server project" step unpacks it
+# automatically.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Wrangler environment"
+        type: string
+        default: production
+  push:
+    branches: [main]
+    paths:
+      - server/**
+      - '*.zip'
+      - .github/workflows/deploy-worker.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dolomite-worker-deploy
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: server
+
+env:
+  # Wrangler must never try to open a browser or prompt in CI.
+  CI: "true"
+  WRANGLER_SEND_METRICS: "false"
+
+jobs:
+  deploy:
+    name: Test, then publish the Worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Prepare the server project
+        working-directory: .
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f server/package.json ]; then
+            echo "server/ is already extracted — nothing to do."
+            exit 0
+          fi
+          tmp="$(mktemp -d)"
+          for zip in Dolomite-monorepo.zip dolomite-dashboard.zip; do
+            [ -f "$zip" ] || continue
+            rm -rf "$tmp" && mkdir -p "$tmp"
+            echo "looking for the server inside $zip"
+            unzip -q "$zip" -d "$tmp" || continue
+            found="$(find "$tmp" -maxdepth 4 -name server.js -type f -print -quit)"
+            if [ -n "$found" ]; then
+              srcdir="$(dirname "$found")"
+              mkdir -p server
+              cp -R "$srcdir"/. server/
+              rm -rf "$tmp"
+              echo "::notice::extracted server/ from $zip"
+              exit 0
+            fi
+          done
+          echo "::error::No server project found."
+          echo "::error::Expected server/package.json, or one of: Dolomite-monorepo.zip, dolomite-dashboard.zip"
+          echo "--- repository root ---"
+          ls -la
+          exit 1
+
+      - name: Verify the project layout
+        shell: bash
+        run: |
+          set -uo pipefail
+          missing=0
+          for path in package.json server.js lib public worker test; do
+            if [ ! -e "$path" ]; then
+              echo "::error::missing $path"
+              missing=1
+            fi
+          done
+          if [ "$missing" = "1" ]; then
+            echo "::error::The server is not inside server/. Expected layout:"
+            echo "  server/package.json"
+            echo "  server/server.js"
+            echo "  server/lib/"
+            echo "  server/public/"
+            echo "  server/worker/"
+            echo "--- repository root ---"
+            ls -la
+            exit 1
+          fi
+          echo "layout ok"
+
+      - name: Check the Cloudflare credentials
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -uo pipefail
+          problems=0
+
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            echo "::error::Secret CLOUDFLARE_API_TOKEN is not set on this repository."
+            problems=1
+          fi
+          if [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "::error::Secret CLOUDFLARE_ACCOUNT_ID is not set on this repository."
+            problems=1
+          fi
+          if grep -q "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" worker/wrangler.toml; then
+            echo "::error::worker/wrangler.toml still has the placeholder KV namespace id."
+            problems=1
+          fi
+
+          if [ "$problems" = "1" ]; then
+            echo
+            echo "### What to do"
+            echo
+            echo "1. **CLOUDFLARE_API_TOKEN** — Cloudflare dashboard -> My Profile ->"
+            echo "   API Tokens -> Create Token -> template \"Edit Cloudflare Workers\""
+            echo "   -> copy the value."
+            echo "2. **CLOUDFLARE_ACCOUNT_ID** — Cloudflare dashboard -> Workers & Pages"
+            echo "   -> your account -> Account ID (right-hand side)."
+            echo "3. Add both under **Settings -> Secrets and variables -> Actions**"
+            echo "   as repository *Secrets*."
+            echo "4. **KV namespace** — run locally:"
+            echo "   \`cd server/worker && npx wrangler kv namespace create DOLOMITE_KV\`"
+            echo "   then paste the printed id into worker/wrangler.toml."
+            echo
+            echo "Without those the Worker cannot be published. If you would rather not"
+            echo "use Cloudflare, the Render path (deploy-render.yml) needs only a"
+            echo "single RENDER_DEPLOY_HOOK secret."
+            exit 1
+          fi
+          echo "credentials present"
+
+      - name: Install tooling
+        run: npm install --no-save wrangler@4
+
+      - name: Authenticate with Cloudflare
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: ./node_modules/.bin/wrangler whoami
+
+      - name: Publish
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          cd worker
+          ../node_modules/.bin/wrangler deploy --minify
+
+      - name: Smoke test the live Worker
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${WORKER_URL:-}" ]; then
+            echo "WORKER_URL repository variable is not set — skipping the smoke test."
+            exit 0
+          fi
+          sleep 5
+          curl -fsS "${WORKER_URL}/health"
+          echo
+          curl -fsS -X POST "${WORKER_URL}/api/v1/dolomite/notice" \
+            -H 'Content-Type: application/json' \
+            -H 'x-dolomite-product: dolomite' \
+            | head -c 300
+          echo
+
+      - name: Write job summary
+        run: |
+          {
+            echo "## Worker deployed"
+            echo
+            echo "- Worker: \`${{ vars.WORKER_URL }}\`"
+            echo "- Dashboard: \`${{ vars.WORKER_URL }}/dashboard\`"
+          } >> "$GITHUB_STEP_SUMMARY"
